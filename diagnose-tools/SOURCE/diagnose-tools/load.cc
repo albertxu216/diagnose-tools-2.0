@@ -1,0 +1,589 @@
+/*
+ * Linux内核诊断工具--用户态load-monitor功能实现
+ *
+ * Copyright (C) 2020 Alibaba Ltd.
+ *
+ * 作者: Baoyou Xie <baoyou.xie@linux.alibaba.com>
+ *
+ * License terms: GNU General Public License (GPL) version 3
+ *
+ */
+
+#include <sched.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <errno.h>
+#include <getopt.h>
+
+#include <iostream>  
+#include <fstream>  
+
+#include <sys/time.h>
+#include <string.h>
+#include <stdio.h>     /* for printf */
+#include <stdlib.h>    /* for exit */
+
+#include "internal.h"
+#include "symbol.h"
+#include "json/json.h"
+#include "uapi/load_monitor.h"
+#include "params_parse.h"
+
+using namespace std;
+
+static char sls_file[256];
+static int syslog_enabled;
+static int process_chains = 0;
+static int out_json = 0;
+static int out_flame = 1;
+
+static Json::FastWriter fast_writer;
+
+void usage_load_monitor(void)
+{
+	printf("    load-monitor usage:\n");
+	printf("        --help load-monitor help info\n");
+	printf("        --activate\n");
+	printf("            verbose VERBOSE\n");
+	printf("            style dump style: 0 - common, 1 - process chains\n");
+	printf("            mass dump all data if mass=1\n");
+	printf("            load threshold for load, default 1000\n");
+	printf("            load.r threshold for load.r, default 500\n");
+	printf("            load.d threshold for load.d, default 100\n");
+	printf("            task.d threshold for task.d\n");
+	printf("            time Monitoring the time of load variation trends,default 0s\n");
+	printf("            	plot Plot the load trend\n");
+	printf("            	timeload View load values during the time\n");
+	printf("        --settings print settings.\n");
+	printf("        --deactivate\n");
+	printf("        --report dump log with text.\n");
+	printf("        --sls save detail into sls files.\n");
+}
+
+static void do_activate(const char *arg)
+{
+	int ret = 0;
+	struct params_parser parse(arg);
+	struct diag_load_monitor_settings settings;
+
+	memset(&settings, 0, sizeof(struct diag_load_monitor_settings));
+	
+	settings.threshold_load = parse.int_value("load", 1000);
+	settings.threshold_load_r = parse.int_value("load.r", 500);
+	settings.threshold_load_d = parse.int_value("load.d", 100);
+	settings.threshold_task_d = parse.int_value("task.d");
+	settings.verbose = parse.int_value("verbose");
+	settings.style = parse.int_value("style");
+	settings.mass = parse.int_value("mass");
+	settings.cpu_run = parse.int_value("cpu.run");
+	settings.time = parse.int_value("time",0);
+
+	if (run_in_host) {
+		ret = diag_call_ioctl(DIAG_IOCTL_LOAD_MONITOR_SET, (long)&settings);
+	} else {
+		ret = -ENOSYS;
+		syscall(DIAG_LOAD_MONITOR_SET, &ret, &settings, sizeof(struct diag_load_monitor_settings));
+	}
+
+	printf("功能设置%s，返回值：%d\n", ret ? "失败" : "成功", ret);
+	printf("    Load：\t%d\n", settings.threshold_load);
+	printf("    Load.R：\t%d\n", settings.threshold_load_r);
+	printf("    Load.D：\t%d\n", settings.threshold_load_d);
+	printf("    Task.D：\t%d\n", settings.threshold_task_d);
+	printf("    输出级别：\t%d\n", settings.verbose);
+	printf("    STYLE：\t%d\n", settings.style);
+	printf("    MASS:\t%d\n", settings.mass);
+	printf("    time:\t%d\n", settings.time);
+	if (ret)
+		return;
+
+	ret = diag_activate("load-monitor");
+	if (ret == 1) {
+		printf("load-monitor activated\n");
+	} else {
+		printf("load-monitor is not activated, ret %d\n", ret);
+	}
+}
+
+static void do_deactivate(void)
+{
+	int ret = 0;
+
+	ret = diag_deactivate("load-monitor");
+	if (ret == 0) {
+		printf("load-monitor is not activated\n");
+	} else {
+		printf("deactivate load-monitor fail, ret is %d\n", ret);
+	}
+}
+
+static void do_settings(const char *arg)
+{
+	struct diag_load_monitor_settings settings;
+	int ret;
+	int enable_json = 0;
+	Json::Value root;
+	struct params_parser parse(arg);
+	enable_json = parse.int_value("json");
+
+	if (run_in_host) {
+		ret = diag_call_ioctl(DIAG_IOCTL_LOAD_MONITOR_SETTINGS, (long)&settings);
+	} else {
+		ret = -ENOSYS;
+		syscall(DIAG_LOAD_MONITOR_SETTINGS, &ret, &settings, sizeof(struct diag_load_monitor_settings));
+	}
+
+	if (ret == 0) {
+		if (1 != enable_json)
+		{
+			printf("功能设置：\n");
+			printf("    是否激活：\t%s\n", settings.activated ? "√" : "×");
+			printf("    Load：\t%d\n", settings.threshold_load);
+			printf("    Load.R：\t%d\n", settings.threshold_load_r);
+			printf("    Load.D：\t%d\n", settings.threshold_load_d);
+			printf("    Task.D：\t%d\n", settings.threshold_task_d);
+			printf("    输出级别：\t%d\n", settings.verbose);
+			printf("    STYLE：\t%d\n", settings.style);
+			printf("    MASS:\t%d\n", settings.mass);
+			printf("    time:\t%d\n", settings.time);
+
+		}
+		else
+		{
+			root["activated"] = Json::Value(settings.activated);
+			root["Load"] = Json::Value(settings.threshold_load);
+			root["Load.R"] = Json::Value(settings.threshold_load_r);
+			root["Load.D"] = Json::Value(settings.threshold_load_d);
+			root["Task.D"] = Json::Value(settings.threshold_task_d);
+			root["verbose"] = Json::Value(settings.verbose);
+			root["STYLE"] = Json::Value(settings.style);
+			root["time"] = Json::Value(settings.time);
+		}
+	} else {
+		if ( 1 != enable_json)
+		{
+			printf("获取load-monitor设置失败，请确保正确安装了diagnose-tools工具\n");
+		}
+
+		else
+		{
+			root["err"]=Json::Value("found load-monitor settings failed, please check diagnose-tools installed or not\n");
+		}
+	}
+
+	if (1 == enable_json)
+	{
+		std::string str_log;
+		str_log.append(root.toStyledString());
+		printf("%s", str_log.c_str());
+	}
+
+	return;
+
+}
+
+static int load_monitor_extract(void *buf, unsigned int len, void *)
+{
+	int *et_type;
+	struct load_monitor_detail *detail;
+	struct load_monitor_task *tsk_info;
+	struct load_monitor_cpu_run *cpu_run;
+	static int seq = 0;
+
+	if (len == 0)
+		return 0;
+
+	et_type = (int *)buf;
+	switch (*et_type) {
+	case et_load_monitor_detail:
+		if (len < sizeof(struct load_monitor_detail))
+			break;
+		detail = (struct load_monitor_detail *)buf;
+
+	    printf("load异常时间点：%s\tload值：%s",
+					detail->bad_time, detail->init_load);
+
+		printf("Load飙高：[%lu:%lu]\n",
+					detail->tv.tv_sec, detail->tv.tv_usec);
+		printf("\tLoad: %d.%02d, %d.%02d, %d.%02d\n",
+					detail->load_1_1, detail->load_1_2,
+					detail->load_5_1, detail->load_5_2,
+					detail->load_15_1, detail->load_15_2);
+		printf("\tLoad.R: %d.%02d, %d.%02d, %d.%02d\n",
+					detail->load_r_1_1, detail->load_r_1_2,
+					detail->load_r_5_1, detail->load_r_5_2,
+					detail->load_r_15_1, detail->load_r_15_2);
+		printf("\tLoad.D: %d.%02d, %d.%02d, %d.%02d\n",
+					detail->load_d_1_1, detail->load_d_1_2,
+					detail->load_d_5_1, detail->load_d_5_2,
+					detail->load_d_15_1, detail->load_d_15_2);
+
+		break;
+	case et_load_monitor_task:
+		if (len < sizeof(struct load_monitor_task))
+			break;
+		tsk_info = (struct load_monitor_task *)buf;
+		seq++;
+		printf("##CGROUP:[%s]  %d      [%03d]  采样命中[%s]\n",
+				tsk_info->task.cgroup_buf,
+				tsk_info->task.pid,
+				seq,
+				tsk_info->task.state == 0 ? "R" : "D");
+
+		diag_printf_kern_stack(&tsk_info->kern_stack);
+
+		printf("#*        0xffffffffffffff %s (UNKNOWN)\n",
+				tsk_info->task.comm);
+		diag_printf_proc_chains(&tsk_info->proc_chains, 0, process_chains);
+		printf("##\n");
+
+		tsk_info++;
+
+		break;
+	case et_load_monitor_cpu_run:
+		if (len < sizeof(struct load_monitor_cpu_run))
+			break;
+		cpu_run = (struct load_monitor_cpu_run *)buf;
+		printf("输出各CPU当前运行任务: CPU:%lu task:%s(%u)\n",
+			cpu_run->cpu, cpu_run->task.comm, cpu_run->task.pid);
+
+		printf("##CGROUP:[%s]  %u      [%03d]  采样命中[%s]\n",
+				cpu_run->task.cgroup_buf,
+				cpu_run->task.pid,
+				seq,
+				cpu_run->task.state == 0 ? "R" : "D");
+
+		diag_printf_kern_stack(&cpu_run->kern_stack);
+		diag_printf_user_stack(cpu_run->task.tgid,
+				       cpu_run->task.container_tgid,
+				       cpu_run->task.comm,
+				       &cpu_run->user_stack);
+		printf("#*        0xffffffffffffff %s (UNKNOWN)\n",
+			cpu_run->task.comm);
+		printf("#*        0xffffffffffffff cpu:%lu (UNKNOWN)\n", cpu_run->cpu);
+		printf("##\n");
+
+		break;
+	default:
+		break;
+	}
+
+	return 0;
+}
+
+static int sls_extract(void *buf, unsigned int len, void *)
+{
+	int *et_type;
+	struct load_monitor_detail *detail;
+	struct load_monitor_task *tsk_info;
+	Json::Value root;
+	Json::Value tsk;
+	stringstream ss;
+
+	if (len == 0)
+		return 0;
+
+	et_type = (int *)buf;
+	switch (*et_type) {
+	case et_load_monitor_detail:
+		if (len < sizeof(struct load_monitor_detail))
+			break;
+		detail = (struct load_monitor_detail *)buf;
+
+		root["tv_sec"] = Json::Value(detail->tv.tv_sec);
+		root["tv_usec"] = Json::Value(detail->tv.tv_usec);
+
+		ss.str("");
+		ss << detail->load_1_1 << "." << detail->load_1_2;
+		root["load_1"] = Json::Value(ss.str());
+
+		ss.str("");
+		ss << detail->load_5_1 << "." << detail->load_5_2;
+		root["load_5"] = Json::Value(ss.str());
+
+		ss.str("");
+		ss << detail->load_15_1 << "." << detail->load_15_2;
+		root["load_15"] = Json::Value(ss.str());
+
+		ss.str("");
+		ss << detail->load_r_1_1 << "." << detail->load_r_1_2;
+		root["load_r_1"] = Json::Value(ss.str());
+
+		ss.str("");
+		ss << detail->load_r_5_1 << "." << detail->load_r_5_2;
+		root["load_r_5"] = Json::Value(ss.str());
+	
+		ss.str("");
+		ss << detail->load_r_15_1 << "." << detail->load_r_15_2;
+		root["load_r_15"] = Json::Value(ss.str());
+
+		ss.str("");
+		ss << detail->load_d_1_1 << "." << detail->load_d_1_2;
+		root["load_d_1"] = Json::Value(ss.str());
+
+		ss.str("");
+		ss << detail->load_d_5_1 << "." << detail->load_d_5_2;
+		root["load_d_5"] = Json::Value(ss.str());
+
+		ss.str("");
+		ss << detail->load_d_15_1 << "." << detail->load_d_15_2;
+		root["load_d_15"] = Json::Value(ss.str());
+
+		root["id"] = Json::Value(detail->id);
+
+		write_file(sls_file, "load-monitor-summary", &detail->tv, detail->id, 0, root);
+		write_syslog(syslog_enabled, "load-monitor-summary", &detail->tv, detail->id, 0, root);
+
+		break;
+	case et_load_monitor_task:
+		if (len < sizeof(struct load_monitor_task))
+			break;
+		tsk_info = (struct load_monitor_task *)buf;
+
+		tsk["id"] = Json::Value(tsk_info->id);
+		diag_sls_task(&tsk_info->task, tsk);
+		diag_sls_kern_stack(&tsk_info->kern_stack, tsk);
+		diag_sls_proc_chains(&tsk_info->proc_chains, tsk);
+
+		write_file(sls_file, "load-monitor-task", &tsk_info->tv, tsk_info->id, 0, tsk);
+		//root["task"] = Json::Value(tsk);
+		write_syslog(syslog_enabled, "load-monitor-task", &tsk_info->tv, tsk_info->id, 0, tsk);
+		
+		break;
+	default:
+		break;
+	}
+
+	return 0;
+}
+
+static int json_extract(void *buf, unsigned int len, void *)
+{
+	int *et_type;
+	struct load_monitor_detail *detail;
+	struct load_monitor_task *tsk_info;
+	Json::Value root;
+	Json::Value tsk;
+	stringstream ss;
+
+	if (len == 0)
+		return 0;
+
+	et_type = (int *)buf;
+	switch (*et_type) {
+	case et_load_monitor_detail:
+		if (len < sizeof(struct load_monitor_detail))
+			break;
+		detail = (struct load_monitor_detail *)buf;
+
+		root["tv_sec"] = Json::Value(detail->tv.tv_sec);
+		root["tv_usec"] = Json::Value(detail->tv.tv_usec);
+
+		ss.str("");
+		ss << detail->load_1_1 << "." << detail->load_1_2;
+		root["load_1"] = Json::Value(ss.str());
+
+		ss.str("");
+		ss << detail->load_5_1 << "." << detail->load_5_2;
+		root["load_5"] = Json::Value(ss.str());
+
+		ss.str("");
+		ss << detail->load_15_1 << "." << detail->load_15_2;
+		root["load_15"] = Json::Value(ss.str());
+
+		ss.str("");
+		ss << detail->load_r_1_1 << "." << detail->load_r_1_2;
+		root["load_r_1"] = Json::Value(ss.str());
+
+		ss.str("");
+		ss << detail->load_r_5_1 << "." << detail->load_r_5_2;
+		root["load_r_5"] = Json::Value(ss.str());
+	
+		ss.str("");
+		ss << detail->load_r_15_1 << "." << detail->load_r_15_2;
+		root["load_r_15"] = Json::Value(ss.str());
+
+		ss.str("");
+		ss << detail->load_d_1_1 << "." << detail->load_d_1_2;
+		root["load_d_1"] = Json::Value(ss.str());
+
+		ss.str("");
+		ss << detail->load_d_5_1 << "." << detail->load_d_5_2;
+		root["load_d_5"] = Json::Value(ss.str());
+
+		ss.str("");
+		ss << detail->load_d_15_1 << "." << detail->load_d_15_2;
+		root["load_d_15"] = Json::Value(ss.str());
+
+		root["id"] = Json::Value(detail->id);
+		root["type"] = "summary";
+		root["tv_sec"] = Json::Value(detail->tv.tv_sec);
+		root["tv_usec"] = Json::Value(detail->tv.tv_usec);
+		root["bad_time"] = Json::Value(detail->bad_time);
+		root["init_load"] = Json::Value(detail->init_load);
+
+		std::cout << "#$" << fast_writer.write(root);
+		break;
+	case et_load_monitor_task:
+		if (len < sizeof(struct load_monitor_task))
+			break;
+		tsk_info = (struct load_monitor_task *)buf;
+
+		tsk["id"] = Json::Value(tsk_info->id);
+		tsk["type"] = "task";
+		tsk["tv_sec"] = Json::Value(tsk_info->tv.tv_sec);
+		tsk["tv_usec"] = Json::Value(tsk_info->tv.tv_usec);
+		diag_sls_task(&tsk_info->task, tsk);
+		diag_sls_kern_stack(&tsk_info->kern_stack, tsk);
+		diag_sls_proc_chains(&tsk_info->proc_chains, tsk);
+
+		std::cout << "#$" << fast_writer.write(tsk);
+		break;
+	default:
+		break;
+	}
+
+	return 0;
+}
+
+static void do_extract(char *buf, int len)
+{
+	if (out_json) {
+		extract_variant_buffer(buf, len, json_extract, NULL);
+	}
+
+	if (out_flame) {
+		extract_variant_buffer(buf, len, load_monitor_extract, NULL);
+	}
+}
+
+static void do_dump(const char *arg)
+{
+	static char variant_buf[50 * 1024 * 1024];
+	struct params_parser parse(arg);
+	int len;
+	int ret = 0;
+	struct diag_ioctl_dump_param dump_param = {
+		.user_ptr_len = &len,
+		.user_buf_len = 50 * 1024 * 1024,
+		.user_buf = variant_buf,
+	};
+
+	process_chains = parse.int_value("process-chains");
+	out_json = parse.int_value("json", 0);
+	out_flame = parse.int_value("flame", 1);
+
+	g_symbol_parser.java_only = parse.int_value("java-only", 0);
+	g_symbol_parser.user_symbol = parse.int_value("user-symbol", 1);
+
+	if (run_in_host) {
+		ret = diag_call_ioctl(DIAG_IOCTL_LOAD_MONITOR_DUMP, (long)&dump_param);
+	} else {
+		ret = -ENOSYS;
+		syscall(DIAG_LOAD_MONITOR_DUMP, &ret, &len, variant_buf, 50 * 1024 * 1024);
+	}
+
+	if (ret == 0) {
+		do_extract(variant_buf, len);
+	}
+}
+
+static void do_sls(char *arg)
+{
+	int ret;
+	static char variant_buf[50 * 1024 * 1024];
+	int len;
+	struct diag_ioctl_dump_param dump_param = {
+		.user_ptr_len = &len,
+		.user_buf_len = 50 * 1024 * 1024,
+		.user_buf = variant_buf,
+	};
+
+	ret = log_config(arg, sls_file, &syslog_enabled);
+	if (ret != 1)
+		return;
+
+	while (1) {
+		if (run_in_host) {
+			ret = diag_call_ioctl(DIAG_IOCTL_LOAD_MONITOR_DUMP, (long)&dump_param);
+		} else {
+			ret = -ENOSYS;
+			syscall(DIAG_LOAD_MONITOR_DUMP, &ret, &len, variant_buf, 50 * 1024 * 1024);
+		}
+
+		if (ret == 0) {
+			pid_cmdline.clear();
+			extract_variant_buffer(variant_buf, len, sls_extract, NULL);
+		}
+
+		sleep(10);
+	}
+}
+static void do_line_plot(){
+	system("python3 /usr/bin/plot.py");
+}
+static void time_load(){
+	system("cat /proc/load_trend");
+}
+int load_monitor_main(int argc, char **argv)
+{
+	static struct option long_options[] = {
+			{"help",     no_argument, 0,  0 },
+			{"activate",     optional_argument, 0,  0 },
+			{"deactivate", no_argument,       0,  0 },
+			{"settings",     optional_argument, 0,  0 },
+			{"report",     optional_argument, 0,  0 },
+			{"log",     required_argument, 0,  0 },
+			{"plot", 	no_argument, 	0,	 0},
+			{"timeload",	no_argument	,	0,	0},
+			{0,         0,                 0,  0 }
+		};
+	int c;
+
+	if (argc <= 1) {
+		usage_load_monitor();
+		return 0;
+	}
+
+	while (1) {
+		int option_index = -1;
+
+		c = getopt_long_only(argc, argv, "", long_options, &option_index);
+		if (c == -1)
+			break;
+		switch (option_index) {
+		case 0:
+			usage_load_monitor();
+			break;
+		case 1:
+			do_activate(optarg ? optarg : "");
+			break;
+		case 2:
+			do_deactivate();
+			break;
+		case 3:
+			do_settings(optarg ? optarg : "");
+			break;
+		case 4:
+			do_dump(optarg ? optarg : "");
+			break;
+		case 5:
+			do_sls(optarg);
+			break;
+		case 6:
+			do_line_plot();
+			break;
+		case 7:
+			time_load();
+			break;
+		default:
+			usage_load_monitor();
+			break;
+		}
+	}
+
+	return 0;
+}
+
